@@ -5,178 +5,131 @@ const OpenAI = require('openai');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-const NUVEMSHOP_TOKEN = process.env.NUVEMSHOP_TOKEN;
-const NUVEMSHOP_STORE_ID = process.env.NUVEMSHOP_STORE_ID;
 const KOMMO_TOKEN = process.env.KOMMO_TOKEN;
 const KOMMO_DOMAIN = process.env.KOMMO_DOMAIN;
 
-// ─────────────────────────────────────────
-// PROMPT BASE DO AGENTE — LION PACKING
-// ─────────────────────────────────────────
-const SYSTEM_PROMPT = `
-Você é um vendedor consultivo da Lion Packing (lionpacking.com.br).
+const SYSTEM_PROMPT = `Você é um vendedor consultivo da Lion Packing (lionpacking.com.br).
 
-Seu objetivo é:
-- Vender
-- Gerar conexão humana
-- Qualificar leads
-- Acelerar orçamentos
-- Conduzir o cliente até uma reunião ou fechamento
+Seu objetivo é: vender, gerar conexão humana, qualificar leads, acelerar orçamentos, conduzir o cliente até reunião ou fechamento.
 
-Tom de comunicação:
-- Humano, moderno, rápido e amigável
-- Linguagem do cotidiano, simples e direta
-- Respeitoso e com postura comercial premium
-- Frases curtas — nunca escreva textos longos
-- Nunca fale como robô
+Tom: humano, moderno, rápido, amigável, cotidiano, respeitoso, linguagem simples, frases curtas, comercial premium.
 
-Regras de interação:
-- Chame o cliente pelo nome sempre que souber
-- Use "meu querido" em saudações naturalmente
-- Use "amigo" de forma casual no decorrer da conversa
-- Mantenha a conversa dinâmica e fluida
-- Nunca use blocos de texto enormes — seja direto
+Sempre: chame o cliente pelo nome quando souber, use "meu querido" em saudações, use "amigo" naturalmente, nunca fale como robô, nunca escreva textos longos, mantenha conversa dinâmica.
 
-Você domina toda a linha de produtos Lion Packing:
-- Válvulas (linha completa)
-- Triggers e Mini Triggers
-- Lotion Pumps
-- Tampas diversas
-- Soluções para segmento Pharma
-- Soluções para Cosmética
-- Soluções para Limpeza
-- Materiais, cores e acabamentos disponíveis
-- Aplicações e compatibilidade de produto
-- Processo produtivo e personalização
-- MOQ (quantidade mínima de pedido)
-- Prazos de produção e entrega
+Você conhece: toda linha de válvulas, triggers, mini triggers, lotion pumps, tampas, soluções pharma, cosméticas, limpeza, materiais, cores, aplicações, produção, MOQ, prazos, personalização.
 
-Objetivo final de cada conversa:
-1. Captar a necessidade real do cliente
-2. Qualificar o volume (quantidade pretendida)
-3. Entender a aplicação (pharma, cosméticos, limpeza etc.)
-4. Direcionar ao vendedor humano quando necessário
-5. Gerar orçamento ou agendar reunião comercial
+Objetivo final: captar necessidade, qualificar volume, entender aplicação, direcionar ao vendedor, gerar orçamento.`;
 
-Lembre-se: você vende embalagens de alta performance. O cliente precisa sentir que está falando com um especialista de verdade — não com um bot.
-`;
+const conversas = {};
 
-// ─────────────────────────────────────────
-// Histórico de conversas por sessão
-// ─────────────────────────────────────────
-const historico = {};
-
-// ─────────────────────────────────────────
-// Busca produtos na Nuvemshop
-// ─────────────────────────────────────────
-async function buscarProdutos(query) {
-  try {
-    const res = await axios.get(
-      `https://api.tiendanube.com/v1/${NUVEMSHOP_STORE_ID}/products?q=${encodeURIComponent(query)}`,
-      {
-        headers: {
-          Authentication: `bearer ${NUVEMSHOP_TOKEN}`,
-          'User-Agent': 'LionPacking Bot'
-        }
-      }
-    );
-    return res.data.slice(0, 3).map(p => ({
-      nome: p.name?.pt || p.name,
-      preco: p.variants?.[0]?.price,
-      link: p.canonical_url
-    }));
-  } catch {
-    return [];
+async function gerarResposta(leadId, nomeContato, mensagemCliente) {
+  if (!conversas[leadId]) {
+    conversas[leadId] = [{ role: 'system', content: SYSTEM_PROMPT }];
   }
-}
+  conversas[leadId].push({ role: 'user', content: mensagemCliente });
 
-// ─────────────────────────────────────────
-// Gera resposta com GPT (com histórico)
-// ─────────────────────────────────────────
-async function gerarResposta(sessionId, mensagem, produtos) {
-  if (!historico[sessionId]) historico[sessionId] = [];
-
-  const contextoProdutos = produtos.length
-    ? `\n\nProdutos relevantes encontrados no site: ${JSON.stringify(produtos, null, 2)}`
-    : '';
-
-  historico[sessionId].push({ role: 'user', content: mensagem });
-
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPT + contextoProdutos },
-    ...historico[sessionId]
-  ];
-
-  const resposta = await openai.chat.completions.create({
+  const completion = await openai.chat.completions.create({
     model: 'gpt-4o',
-    messages,
+    messages: conversas[leadId],
     temperature: 0.8,
-    max_tokens: 300,
-    presence_penalty: 0.6,
-    frequency_penalty: 0.5
+    max_tokens: 300
   });
 
-  const textoResposta = resposta.choices[0].message.content;
-  historico[sessionId].push({ role: 'assistant', content: textoResposta });
-
-  if (historico[sessionId].length > 20) {
-    historico[sessionId] = historico[sessionId].slice(-20);
-  }
-
-  return textoResposta;
+  const resposta = completion.choices[0].message.content;
+  conversas[leadId].push({ role: 'assistant', content: resposta });
+  return resposta;
 }
 
-// ─────────────────────────────────────────
-// Cria ou atualiza lead no Kommo
-// ─────────────────────────────────────────
-async function criarLeadKommo(nome, mensagem, resposta) {
-  try {
-    const leadRes = await axios.post(
-      `https://${KOMMO_DOMAIN}/api/v4/leads`,
-      [{ name: `Lion Packing — ${nome || 'Visitante'}` }],
-      { headers: { Authorization: `Bearer ${KOMMO_TOKEN}` } }
-    );
-
-    const leadId = leadRes.data?._embedded?.leads?.[0]?.id;
-
-    if (leadId) {
-      await axios.post(
-        `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes`,
-        [{ note_type: 4, params: { text: `Cliente: ${mensagem}\n\nBot: ${resposta}` } }],
-        { headers: { Authorization: `Bearer ${KOMMO_TOKEN}` } }
-      );
+async function enviarMensagemKommo(leadId, texto) {
+  const url = `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes`;
+  await axios.post(url, {
+    note_type: 4,
+    params: { text: texto }
+  }, {
+    headers: {
+      Authorization: `Bearer ${KOMMO_TOKEN}`,
+      'Content-Type': 'application/json'
     }
-  } catch (err) {
-    console.error('Kommo error:', err.message);
-  }
+  });
 }
 
-// ─────────────────────────────────────────
-// WEBHOOK — recebe mensagens
-// ─────────────────────────────────────────
+async function enviarMensagemChat(talkId, texto) {
+  const url = `https://${KOMMO_DOMAIN}/api/v4/talks/${talkId}/reply`;
+  await axios.post(url, { text: texto }, {
+    headers: {
+      Authorization: `Bearer ${KOMMO_TOKEN}`,
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
+// Health check
+app.get('/', (req, res) => res.json({ status: 'Lion Packing Bot online' }));
+app.get('/webhook', (req, res) => res.json({ status: 'ok' }));
+
+// Webhook principal
 app.post('/webhook', async (req, res) => {
-  const { message, contact_name, session_id } = req.body;
-
-  if (!message) return res.status(400).json({ error: 'Mensagem vazia' });
-
-  const sessionId = session_id || contact_name || 'default';
+  console.log('Webhook recebido:', JSON.stringify(req.body).substring(0, 500));
+  res.status(200).json({ ok: true });
 
   try {
-    const produtos = await buscarProdutos(message);
-    const resposta = await gerarResposta(sessionId, message, produtos);
-    await criarLeadKommo(contact_name, message, resposta);
+    const body = req.body;
 
-    res.json({ reply: resposta });
+    // Mensagem de chat recebida (incoming_chat_message)
+    if (body.message && body.message.add) {
+      for (const msg of body.message.add) {
+        if (msg.type === 'incoming' || (msg.author && msg.author.type === 'contact')) {
+          const leadId = msg.entity && msg.entity.id;
+          const talkId = msg.talk_id;
+          const texto = msg.text || (msg.content && msg.content.text) || '';
+          const nomeContato = (msg.author && msg.author.name) || 'cliente';
+
+          if (!texto) continue;
+
+          console.log(`Mensagem de ${nomeContato} no lead ${leadId}: ${texto}`);
+          const resposta = await gerarResposta(leadId || talkId, nomeContato, texto);
+          console.log(`Resposta GPT: ${resposta}`);
+
+          if (talkId) {
+            try {
+              await enviarMensagemChat(talkId, resposta);
+            } catch (e) {
+              console.log('Erro chat reply, tentando nota:', e.message);
+              if (leadId) await enviarMensagemKommo(leadId, resposta);
+            }
+          } else if (leadId) {
+            await enviarMensagemKommo(leadId, resposta);
+          }
+        }
+      }
+    }
+
+    // Novo lead adicionado
+    if (body.leads && body.leads.add) {
+      for (const lead of body.leads.add) {
+        const leadId = lead.id;
+        const nomeLead = lead.name || 'Novo lead';
+        console.log(`Novo lead: ${leadId} - ${nomeLead}`);
+
+        const resposta = await gerarResposta(leadId, nomeLead, `Olá, tenho interesse nos produtos da Lion Packing`);
+        await enviarMensagemKommo(leadId, resposta);
+      }
+    }
+
+    // Mensagem recebida via unsorted (inbox)
+    if (body.unsorted && body.unsorted.add) {
+      for (const item of body.unsorted.add) {
+        console.log('Unsorted recebido:', JSON.stringify(item).substring(0, 200));
+      }
+    }
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Erro interno no bot' });
+    console.error('Erro processando webhook:', err.message);
   }
 });
 
-app.get('/', (req, res) => res.send('Lion Packing Bot — online'));
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Lion Packing Bot rodando na porta ' + PORT));
+app.listen(PORT, () => console.log(`Lion Packing Bot rodando na porta ${PORT}`));
